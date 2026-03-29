@@ -40,6 +40,10 @@ canvas{display:block}
 .eon{color:#00cc44;text-shadow:0 0 5px #00cc4455}
 .eoff{color:#334}
 
+.curr-low{color:#00ccff;text-shadow:0 0 5px #00ccff55}
+.curr-med{color:#ff8800;text-shadow:0 0 5px #ff880055}
+.curr-high{color:#ff2200;text-shadow:0 0 5px #ff220055}
+
 .panel{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(4,10,16,.97);border:1px solid #00d4ff33;padding:22px 26px;z-index:50;display:none;pointer-events:all;min-width:330px;box-shadow:0 8px 40px rgba(0,0,0,.95)}
 .panel.show{display:block}
 .panel h2{color:#00d4ff;font-size:11px;letter-spacing:2px;margin-bottom:14px;border-bottom:1px solid #00d4ff22;padding-bottom:8px;text-transform:uppercase}
@@ -123,6 +127,7 @@ canvas{display:block}
   <h2 id="brkH">Vermogenschakelaar</h2>
   <div class="row"><span class="lbl">Status</span>     <span class="val" id="bSt"></span></div>
   <div class="row"><span class="lbl">Spanning</span>   <span class="val" id="bKV"></span></div>
+  <div class="row"><span class="lbl">Stroom</span>     <span class="val" id="bCurr"></span></div>
   <div class="row"><span class="lbl">Operaties</span>  <span class="val" id="bOp"></span></div>
   <div class="row" id="bTR"><span class="lbl">Trip reden</span><span class="val st-tripped" id="bTRv"></span></div>
   <div class="row"><span class="lbl">Scheider net</span>  <span class="val" id="bD1"></span></div>
@@ -142,6 +147,7 @@ canvas{display:block}
   <div class="row"><span class="lbl">Status</span>   <span class="val" id="dSt"></span></div>
   <div class="row"><span class="lbl">Type</span>     <span class="val" id="dTy"></span></div>
   <div class="row"><span class="lbl">Spanning</span> <span class="val" id="dKV"></span></div>
+  <div class="row"><span class="lbl">Stroom</span>   <span class="val" id="dCurr"></span></div>
   <div class="row"><span class="lbl">Interlock</span><span class="val" id="dIL" style="font-size:11px;color:#668"></span></div>
   <div class="btns">
     <button class="btn-ok"  id="dClose">Sluiten</button>
@@ -1558,6 +1564,7 @@ function energy(){
   if(typeof ductStrip!=='undefined') ductStrip.material.color.setHex(r10kV?0xff9900:0x443322)
   bb10meshes.forEach(b=>b.material.color.setHex(r10kV?0xff9900:0x443322))
   eHUD('eSol',rSol); eHUD('e110',r110); eHUD('eTF',r10kV); eHUD('eL1',rL1); eHUD('eL2',rL2); eHUD('eL3',rL3)
+  calculateCurrents()
   return{r110,rTF:r10kV,rTFnet,rTFhv,rL1,rL2,rL3,rSol,rSolSrc,r10kV,rL3sol}
 }
 function eHUD(id,on){
@@ -1618,6 +1625,93 @@ function energisedCBs(){
   // CB_SOL voert stroom als zonneparkpad gesloten is
   if(ds('DS_SOL')&&cb('CB_SOL')&&solarOnline) set.add('CB_SOL')
   return set
+}
+
+// ─────────────────────────────────────────────────────
+// CURRENT CALCULATION (Stroommetingen)
+// ─────────────────────────────────────────────────────
+// Initializeer stroomwaarden in alle devices
+function initCurrents(){
+  for(const [id,cb] of Object.entries(CBs)) cb.current=0
+  for(const [id,ds] of Object.entries(DSs)) ds.current=0
+}
+initCurrents()
+
+// Berekent realistische stroomsterktes gebaseerd op circuitstatus
+function calculateCurrents(){
+  initCurrents()
+  const ds=id=>DSs[id]?.state===ST.CLOSED
+  const cb=id=>CBs[id]?.state===ST.CLOSED
+  
+  // Lokale energy state berekenen (geen recursie!)
+  const r110   = ds('DS_HV1')&&cb('CB_HV')&&ds('DS_HV2')
+  const rTFnet = r110&&ds('DS_TR1')&&cb('CB_TR')&&ds('DS_TR2')
+  const rSolSrc = solarOnline&&ds('DS_SOL')&&cb('CB_SOL')
+  const rL3sol  = rSolSrc&&ds('DS_L3')&&cb('CB_L3')
+  const r10kV = rTFnet || rL3sol
+  const rL1 = r10kV&&ds('DS_L1')&&cb('CB_L1')
+  const rL2 = r10kV&&ds('DS_L2')&&cb('CB_L2')
+  const rL3 = (r10kV&&ds('DS_L3')&&cb('CB_L3')) || rL3sol
+  const rSol = rSolSrc && ds('DS_L3')&&cb('CB_L3')
+  const rTFhv = r110&&ds('DS_TR1')&&cb('CB_TR')&&ds('DS_TR2')
+  
+  // Basis belastingen (MW/kW)
+  const LOAD_L1=2.5, LOAD_L2=1.8, LOAD_L3=0.8  // 10kV afnemers MW
+  const NET_POWER=15                             // 110kV net levering MW
+  
+  // HV side (110kV) — ongeveer 60A bij 110kV, 20MVA transformator
+  if(r110){
+    const hv_current=NET_POWER/(110*Math.sqrt(3)/1000)*1000  // I = P/(√3·U)
+    CBs['CB_HV'].current=hv_current
+  }
+  
+  // Transformator HV zijde (proportioneel aan 110kV stroom)
+  if(rTFhv) CBs['CB_TR'].current=CBs['CB_HV'].current*0.95
+  
+  // 10kV side — aangesloten lasten bepalen de stroom
+  let total10kV=0
+  if(r10kV){
+    // L1 feeder
+    if(rL1){
+      const i_l1=LOAD_L1/(10*Math.sqrt(3)/1000)*1000
+      CBs['CB_L1'].current=i_l1
+      total10kV+=LOAD_L1
+    }
+    // L2 feeder
+    if(rL2){
+      const i_l2=LOAD_L2/(10*Math.sqrt(3)/1000)*1000
+      CBs['CB_L2'].current=i_l2
+      total10kV+=LOAD_L2
+    }
+    // L3 feeder (zonnepark terugvoeding)
+    if(rL3){
+      const i_l3=LOAD_L3/(10*Math.sqrt(3)/1000)*1000
+      CBs['CB_L3'].current=i_l3
+      if(!rTFnet&&rSol) total10kV-=solarOutputMW  // Terugvoeding vermindert belasting
+    }
+  }
+  
+  // Zonnepark uitgang (parallel met L3)
+  if(rSol&&rSolSrc){
+    CBs['CB_SOL'].current=solarOutputMW/(10*Math.sqrt(3)/1000)*1000
+  }
+  
+  // Scheiders krijgen dezelfde stroom als hun bijbehorende CB
+  DSs['DS_HV1'].current=CBs['CB_HV'].current
+  DSs['DS_HV2'].current=CBs['CB_HV'].current
+  DSs['DS_TR1'].current=CBs['CB_TR'].current
+  DSs['DS_TR2'].current=CBs['CB_TR'].current
+  DSs['DS_L1'].current=CBs['CB_L1'].current
+  DSs['DS_L2'].current=CBs['CB_L2'].current
+  DSs['DS_L3'].current=Math.max(CBs['CB_L3'].current,CBs['CB_SOL'].current)
+  DSs['DS_SOL'].current=CBs['CB_SOL'].current
+}
+
+// Helper: stroomwaarde formatteren
+function formatCurrent(amps,kv){
+  if(amps<1) return '0.0 A'
+  if(kv>30) return (amps/1000).toFixed(2)+' kA'  // HV: kA
+  return amps.toFixed(1)+' A'                     // LV: A
 }
 
 function tripCB(id,reason,iedKey){
@@ -1735,6 +1829,22 @@ function populateCB(){
   const st=document.getElementById('bSt'); st.textContent=b.state; st.className='val st-'+b.state.toLowerCase()
   document.getElementById('bKV').textContent=`${b.kv} kV`
   document.getElementById('bOp').textContent=b.ops
+  // Stroomwaarde toevoegen
+  calculateCurrents()
+  const currElem=document.getElementById('bCurr')
+  if(currElem){
+    currElem.textContent=formatCurrent(b.current,b.kv)
+    // Kleur gebaseerd op stroomsterkte
+    let cls='curr-low'
+    if(b.kv>30){  // HV: 110kV
+      if(b.current>150) cls='curr-high'
+      else if(b.current>80) cls='curr-med'
+    }else{  // LV: 10kV
+      if(b.current>300) cls='curr-high'
+      else if(b.current>150) cls='curr-med'
+    }
+    currElem.className='val '+cls
+  }
   document.getElementById('bTR').style.display=b.tripReason?'flex':'none'
   document.getElementById('bTRv').textContent=b.tripReason??''
   document.getElementById('bD1').textContent=b.ds1?`${b.ds1}: ${DSs[b.ds1]?.state??'—'}`:'—'
@@ -1754,6 +1864,22 @@ function populateDS(){
   const st=document.getElementById('dSt'); st.textContent=d.state; st.className='val st-'+d.state.toLowerCase()
   document.getElementById('dTy').textContent=d.type
   document.getElementById('dKV').textContent=`${d.kv} kV`
+  // Stroomwaarde toevoegen
+  calculateCurrents()
+  const currElem=document.getElementById('dCurr')
+  if(currElem){
+    currElem.textContent=formatCurrent(d.current,d.kv)
+    // Kleur gebaseerd op stroomsterkte
+    let cls='curr-low'
+    if(d.kv>30){  // HV: 110kV
+      if(d.current>150) cls='curr-high'
+      else if(d.current>80) cls='curr-med'
+    }else{  // LV: 10kV
+      if(d.current>300) cls='curr-high'
+      else if(d.current>150) cls='curr-med'
+    }
+    currElem.className='val '+cls
+  }
   const linked=Object.entries(CBs).filter(([,cb])=>cb.ds1===activeDS||cb.ds2===activeDS).map(([id])=>id)
   document.getElementById('dIL').textContent=linked.length?`Interlock: ${linked.join(', ')}`:'Geen CB-interlock'
 }
